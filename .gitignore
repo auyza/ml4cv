@@ -1,0 +1,8 @@
+data/face
+env/
+data/datasets/animals
+*.zip
+*.jpg
+*.jpeg
+output/*
+env310
