@@ -1,138 +1,178 @@
-import tensorflow as tf
-import cv2
+import cv2 as cv
+import matplotlib.pyplot as plt
 import numpy as np
-import mediapipe as mp
-from sklearn.model_selection import train_test_split
-import os
-import glob  # Import the glob module!  This is the fix.
+from PIL import Image
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay)
+import seaborn as sns
 
-# 1. Data Collection and Preparation (Simplified Example - Replace with your actual data loading)
-# This example creates dummy data.  In a real application, you would load your data from files.
-def load_data(data_dir, label_map=None): # Added label_map
-    images = []
-    labels = []
+import tensorflow as tf
+from tensorflow.io import TFRecordWriter
+from tensorflow.keras import Sequential
+from tensorflow.keras.callbacks  import (
+    Callback,
+    CSVLogger,
+    EarlyStopping,
+    LearningRateScheduler,
+    ModelCheckpoint
+)
+from tensorflow.keras.layers import (
+    Layer,
+    GlobalAveragePooling2D,
+    Conv2D,
+    MaxPool2D,
+    Dense,
+    Flatten,
+    InputLayer,
+    BatchNormalization,
+    Input,
+    Dropout,
+    RandomFlip,
+    RandomRotation,
+    RandomContrast,
+    RandomBrightness,
+    Resizing,
+    Rescaling
+)
+from tensorflow.keras.losses import BinaryCrossentropy, CategoricalCrossentropy, SparseCategoricalCrossentropy
+from tensorflow.keras.metrics import CategoricalAccuracy, TopKCategoricalAccuracy, SparseCategoricalAccuracy
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.regularizers import L2, L1
+from tensorflow.keras.utils import image_dataset_from_directory
+from tensorflow.train import Feature, Features, Example, BytesList, Int64List
 
-    subdirs = glob.glob(os.path.join(data_dir, "*"))
 
-    for subdir in subdirs:
-        if os.path.isdir(subdir):
-            label_name = os.path.basename(subdir)
+BATCH = 32
+SIZE = 224
+SEED = 42
 
-            if label_map is None: # If no label_map provided, use folder name as label
-                label = label_name
-            else: # Use label_map to convert folder name to label
-                if label_name in label_map:
-                    label = label_map[label_name]
-                else:
-                    print(f"Skipping directory {subdir}: Label not found in label_map.")
-                    continue
+EPOCHS = 20
+LR = 0.001
+FILTERS = 6
+KERNEL = 3
+STRIDES = 1
+REGRATE = 0.0
+POOL = 2
+DORATE = 0.05
+LABELS = ['daisy', 'dandelion', 'rose', 'sunflower', 'tulip']
+NLABELS = len(LABELS)
+DENSE1 = 1024
+DENSE2 = 128
 
-            for image_file in glob.glob(os.path.join(subdir, "*")):
-                if image_file.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                    img = cv2.imread(image_file)
-                    if img is not None:
-                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        images.append(img)
-                        labels.append(label)
-    return images, labels
+train_directory = 'data/datasets/Flower/train'
+test_directory = 'data/datasets/Flower/test'
+
+train_dataset = image_dataset_from_directory(
+    train_directory,
+    labels='inferred',
+    label_mode='categorical',
+    # class_names=LABELS,
+    color_mode='rgb',
+    batch_size=BATCH,
+    image_size=(SIZE, SIZE),
+    shuffle=True,
+    seed=SEED,
+    interpolation='bilinear',
+    follow_links=False,
+    crop_to_aspect_ratio=False
+)
+
+# Found 9206 files belonging to 48 classes.
+
+test_dataset = image_dataset_from_directory(
+    test_directory,
+    labels='inferred',
+    label_mode='categorical',
+    # class_names=LABELS,
+    color_mode='rgb',
+    batch_size=BATCH,
+    image_size=(SIZE, SIZE),
+    shuffle=True,
+    seed=SEED
+)
+
+# Found 3090 files belonging to 48 classes.
+
+data_augmentation = Sequential([
+        # Resizing(224, 224),
+        RandomRotation(factor=0.25),
+        RandomFlip(mode='horizontal'),
+        RandomContrast(factor=0.1),
+        RandomBrightness(0.1)
+    ],
+    name="img_augmentation",
+)
+
+training_dataset = (
+    train_dataset
+    .map(lambda image, label: (data_augmentation(image), label))
+    .prefetch(tf.data.AUTOTUNE)
+)
 
 
-# 2. Face Detection (MediaPipe)
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+testing_dataset = (
+    test_dataset.prefetch(
+        tf.data.AUTOTUNE
+    )
+)
 
-def detect_faces(image):
-    results = face_detection.process(image)
-    faces = []
-    if results.detections:
-        h, w, _ = image.shape  # Get image dimensions ONCE
+# Building the Efficient TF Model
 
-        for detection in results.detections:
-            bbox = detection.location_data.relative_bounding_box
+# transfer learning
 
-            x = int(bbox.xmin * w)
-            y = int(bbox.ymin * h)
-            width = int(bbox.width * w)
-            height = int(bbox.height * h)
+backbone = tf.keras.applications.EfficientNetV2B0(
+    include_top=False,
+    weights="imagenet",
+    input_shape=(SIZE, SIZE, 3),
+    include_preprocessing=True
+)
 
-            # Clip the bounding box to image boundaries (THE FIX):
-            x = max(0, x)  # Ensure x is not less than 0
-            y = max(0, y)  # Ensure y is not less than 0
-            width = min(w - x, width)  # Ensure width doesn't go beyond image right edge
-            height = min(h - y, height)  # Ensure height doesn't go beyond image bottom edge
+backbone.trainable = False
 
-            # Check for valid bounding box AFTER clipping:
-            if width > 0 and height > 0:  # Only append if width and height are still positive
-                faces.append((x, y, width, height))
-            else:
-                print(f"Invalid bounding box after clipping: {x}, {y}, {width}, {height}. Skipping.")
+efficient_model = tf.keras.Sequential([
+    Input(shape=(SIZE, SIZE, 3)),
+    data_augmentation,
+    backbone,
+    GlobalAveragePooling2D(),
+    Dense(DENSE1, activation='relu'),
+    BatchNormalization(),
+    Dense(DENSE2, activation='relu'),
+    Dense(NLABELS, activation='softmax')
+])
 
-    return faces
+efficient_model.summary()
 
-# 3. Data Preprocessing (including face cropping and resizing)
-def preprocess_face(image, bbox, target_size=(128, 128)):
-  x, y, w, h = bbox
-  face_img = image[y:y+h, x:x+w]
-  face_img_resized = cv2.resize(face_img, target_size)
-  face_img_normalized = face_img_resized / 255.0 # Normalize pixel values
-  return face_img_normalized
+checkpoint_callback = ModelCheckpoint(
+    '../best_weights',
+    monitor='val_accuracy',
+    mode='max',
+    verbose=1,
+    save_best_only=True
+)
 
-# 4. Model Training (using MobileNetV3Small as an example)
-def train_smile_model(x_train, y_train, x_val, y_val, epochs=5, batch_size=32):
-    base_model = tf.keras.applications.EfficientNetV2B0(weights='imagenet', include_top=False, input_shape=(128, 128, 3))  # Use EfficientNetV2B0
-    base_model.trainable = False  # Freeze the base model initially
+loss_function = CategoricalCrossentropy()
 
-    model = tf.keras.Sequential([
-        base_model,
-        tf.keras.layers.GlobalAveragePooling2D(),
-        tf.keras.layers.Dense(1, activation='sigmoid')  # Output: probability of smiling
-    ])
+metrics = [CategoricalAccuracy(name='accuracy')]
 
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+efficient_model.compile(
+    optimizer = Adam(learning_rate=LR),
+    loss = loss_function,
+    metrics = metrics
+)
 
-    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True) # Add early stopping
+# Model Training
+efficient_history = efficient_model.fit(
+    training_dataset,
+    validation_data = testing_dataset,
+    epochs = EPOCHS,
+    verbose = 1
+)
 
-    model.fit(x_train, y_train, validation_data=(x_val, y_val), epochs=epochs, batch_size=batch_size, callbacks=[early_stopping])
-
-    return model
-
-# 5. Main Execution
-if __name__ == "__main__":
-    data_dir = "data/datasets/mini-proj/original/" # Replace with the path to your data directory
-    # Define a label map to convert folder names to labels:
-    label_map = {
-        "non_smile": 0,  # Map "non_smile" folder to label 0
-        "smile": 1,      # Map "smile" folder to label 1
-        "test": 2       # Map "test" folder to label 2 (or whatever you want)
-    }
-
-    print("[INFO] start load data .. ")
-    images, labels = load_data(data_dir, label_map) # Pass the label_map
-    # images, labels = load_data(data_dir)
-    
-    print("[INFO] completed load data .. ")
-    print("[INFO] start detect face image .. ")
-
-    face_images = []
-    face_labels = []
-
-    for image, label in zip(images, labels):
-        faces = detect_faces(image)
-        if faces: # If faces are detected
-            for face in faces:
-                processed_face = preprocess_face(image, face)
-                face_images.append(processed_face)
-                face_labels.append(label) # Use original label for the face
-
-    print("[INFO] start split data .. ")
-    x_train, x_val, y_train, y_val = train_test_split(np.array(face_images), np.array(face_labels), test_size=0.2, random_state=42)
-    
-    print("[INFO] start start train model .. ")
-    smile_model = train_smile_model(x_train, y_train, x_val, y_val)
-    smile_model.save("src/miniproj/model_save/smile_detection_model.keras") # Save the trained model
-    
-    print("[INFO] Model trained and saved!")
-
-    # Example of loading and using the saved model:
-    # loaded_model = tf.keras.models.load_model("smile_detection_model")
-    # ... (Use loaded_model for inference) ...
+# loss: 0.2039
+# accuracy: 0.9343
+# val_loss: 0.3764
+# val_accuracy: 0.9026

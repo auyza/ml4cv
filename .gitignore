@@ -6,3 +6,6 @@ data/datasets/animals
 *.jpeg
 output/*
 env310
+*.pyc
+data/datasets/mini-proj/
+data/dataset/output
